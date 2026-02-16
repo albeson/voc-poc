@@ -1,9 +1,10 @@
 const usb = require('usb')
-const yargs = require('yargs')
 const fs = require('fs')
 
+const yargs = require('yargs/yargs')
+const { hideBin } = require('yargs/helpers')
 
-const argv = yargs
+const argv = yargs(hideBin(process.argv))
     .option('f', {
         alias: 'file',
         describe: 'output video feed to file',
@@ -11,89 +12,140 @@ const argv = yargs
     })
     .option('o', {
         alias: 'stdout',
-        describe: 'send video feed to stdout for playback. eg: node index.js -o | ffplay -',
+        describe: 'send video feed to stdout (ex: node index.js -o | ffplay -)',
         type: 'boolean'
     })
     .option('s', {
         alias: 'readsize',
-        describe: 'size in bytes to queue for usb bulk interface reads',
+        describe: 'USB bulk read size in bytes',
         default: 512,
-        type: 'integer'
+        type: 'number'
     })
     .option('q', {
         alias: 'queuesize',
-        describe: 'number of polling usb bulk read requests to keep in flight',
+        describe: 'Number of USB read requests in flight',
         default: 3,
-        type: 'integer'
+        type: 'number'
     })
     .option('v', {
         alias: 'verbose',
-        describe: 'be noisy - doesn not play well with -o',
+        describe: 'Verbose logging (not recommended with -o)',
         type: 'boolean'
     })
     .help()
     .alias('help', 'h')
-    .argv;
+    .parse()
 
-var goggles = usb.findByIds("0x2ca3", "0x1f")
+// ---- DEVICE DETECTION ----
 
-if(!goggles) {
-    console.error("Goggles USB device not found. Please connect your goggles and restart the script.")
+const VENDOR_ID = 0x2ca3
+const PRODUCT_ID = 0x0020
+
+const goggles = usb.findByIds(VENDOR_ID, PRODUCT_ID)
+
+if (!goggles) {
+    console.error("Goggles USB device not found.")
     process.exit(1)
 }
+
 goggles.open()
-if(!goggles.interfaces) {
-    console.error("Couldn't open Goggles USB device")
-    process.exit(1)
-}
-var interface = goggles.interface(3)
-interface.claim()
-if(!interface.endpoints) {
-    console.error("Couldn't claim bulk interface")
+
+// Select interface 3 (known bulk interface for DJI goggles)
+const iface = goggles.interface(3)
+
+if (!iface) {
+    console.error("USB interface not found.")
     process.exit(1)
 }
 
-if(!argv.f && !argv.o) {
-    console.log("warning: no outputs specified")
+iface.claim()
+
+// ---- ENDPOINT DETECTION ----
+
+const inpoint = iface.endpoints.find(e => e.direction === 'in')
+const outpoint = iface.endpoints.find(e => e.direction === 'out')
+
+if (!inpoint || !outpoint) {
+    console.error("Bulk endpoints not found.")
+    process.exit(1)
+}
+
+inpoint.timeout = 100
+
+// ---- OUTPUT SETUP ----
+
+let fd = null
+
+if (!argv.f && !argv.o) {
+    console.log("Warning: no output specified. Enabling verbose mode.")
     argv.v = true
 }
 
-var fd
-
-var inpoint = interface.endpoints[1]
-inpoint.timeout = 100
-//outpoint.timeout = 200
-
-var outpoint = interface.endpoints[0]
-var magic = Buffer.from("524d5654", "hex")
-
-outpoint.transfer(magic, function(error) {
-    if(error) {
-        console.error(error)
+if (argv.f) {
+    try {
+        fd = fs.openSync(argv.f, "w")
+    } catch (err) {
+        console.error("Could not open file:", err.message)
+        process.exit(1)
     }
-    console.debug("send magic bytes")
+}
 
+// ---- MAGIC PACKET ----
+
+const magic = Buffer.from("524d5654", "hex")
+
+outpoint.transfer(magic, (error) => {
+    if (error) {
+        console.error("Error sending magic packet:", error)
+        process.exit(1)
+    }
+    if (argv.v) {
+        console.log("Magic packet sent.")
+    }
 })
-inpoint.addListener("data", function(data) {
-    if(argv.o) {
+
+// ---- DATA HANDLING ----
+
+inpoint.on("data", (data) => {
+
+    if (argv.o) {
         process.stdout.write(data)
     }
-    if(argv.v) {
-        console.debug("received "+data.length+" bytes")
-    }
-    if(argv.f) {
-        if(!fd) {
-            fd = fs.openSync(argv.f, "w")
-            if(!fd) {
-                console.error("couldn't open file "+ argv.f + ": "+err)
-                process.exit(1)
-            }
-        }
+
+    if (argv.f && fd) {
         fs.writeSync(fd, data)
     }
+
+    if (argv.v) {
+        console.log(`Received ${data.length} bytes`)
+    }
 })
-inpoint.addListener("error", function(error) {
-    console.error(error)
+
+inpoint.on("error", (error) => {
+    console.error("USB error:", error)
 })
+
+// Start polling
 inpoint.startPoll(argv.q, argv.s)
 
+// ---- CLEANUP HANDLING ----
+
+function cleanup() {
+    console.log("\nShutting down...")
+
+    try {
+        inpoint.stopPoll(() => {
+            iface.release(true, () => {
+                goggles.close()
+                if (fd) fs.closeSync(fd)
+                process.exit(0)
+            })
+        })
+    } catch (err) {
+        console.error("Cleanup error:", err)
+        process.exit(1)
+    }
+}
+
+process.on('SIGINT', cleanup)
+process.on('SIGTERM', cleanup)
